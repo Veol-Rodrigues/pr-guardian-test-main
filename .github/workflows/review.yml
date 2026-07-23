@@ -8,7 +8,10 @@ on:
 jobs:
   review:
     runs-on: ubuntu-latest
-    
+    # Skip draft PRs entirely so we don't burn Gemini API credits on
+    # work-in-progress changes the author isn't ready to have reviewed yet.
+    if: github.event.pull_request.draft == false
+
     # Give GitHub permission to write a comment on the PR
     permissions:
       contents: read

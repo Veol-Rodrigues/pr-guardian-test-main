@@ -33,7 +33,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 GEMINI_URL = (
     f"https://generativelanguage.googleapis.com/v1beta/models/"
-    f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    f"{GEMINI_MODEL}:generateContent"
 )
 
 # Diff chunking configuration. Diffs are grouped by whole-file boundaries
@@ -207,14 +207,35 @@ def chunk_file_blocks(file_blocks, max_lines=MAX_LINES_PER_CHUNK):
 # Gemini calls
 # ---------------------------------------------------------------------------
 
-def call_gemini(payload, retries=2, backoff_seconds=2):
-    """Low-level Gemini call with light retry on transient failures."""
+def call_gemini(payload, retries=2, backoff_seconds=2, json_mode=True):
+    """Low-level Gemini call with light retry on transient failures.
+
+    The API key is sent via the `x-goog-api-key` header rather than as a
+    `?key=` query parameter, so it never ends up in logs, proxies, or
+    error messages that echo back the request URL.
+
+    When `json_mode` is True, Gemini's native structured-output mode is
+    requested (`responseMimeType: application/json`), so the model itself
+    is constrained to emit valid JSON instead of relying on prompt
+    instructions alone. This is left False for calls (like the narrative
+    generator) that intentionally want free-form prose back.
+    """
+    headers = {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
+    }
+
+    request_payload = payload
+    if json_mode:
+        request_payload = dict(payload)
+        generation_config = dict(request_payload.get("generationConfig", {}))
+        generation_config["responseMimeType"] = "application/json"
+        request_payload["generationConfig"] = generation_config
+
     last_error = None
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(
-                GEMINI_URL, json=payload, headers={"Content-Type": "application/json"}
-            )
+            resp = requests.post(GEMINI_URL, json=request_payload, headers=headers)
             resp.raise_for_status()
             data = resp.json()
             return data["candidates"][0]["content"]["parts"][0]["text"]
@@ -278,8 +299,16 @@ def analyze_chunk(chunk_text):
     payload = {"contents": [{"parts": [{"text": build_review_prompt(chunk_text)}]}]}
     try:
         raw_text = call_gemini(payload)
-        cleaned = raw_text.replace("```json", "").replace("```", "").strip()
-        findings = json.loads(cleaned)
+        # Even with native JSON mode requested, be defensive: pull out the
+        # first top-level JSON array from the response with a regex rather
+        # than assuming the text is already clean. This means stray
+        # markdown fences (```json ... ```) or preamble sentences the
+        # model might still add can never crash json.loads().
+        match = re.search(r"\[.*\]", raw_text, re.DOTALL)
+        if not match:
+            print("⚠️  Chunk analysis failed: no JSON array found in response, skipping this chunk.")
+            return []
+        findings = json.loads(match.group(0))
         if not isinstance(findings, list):
             return []
         return findings
@@ -295,7 +324,7 @@ def generate_narrative(pr_title, changed_file_names, findings):
         ]
     }
     try:
-        raw_text = call_gemini(payload)
+        raw_text = call_gemini(payload, json_mode=False)
         return raw_text.strip()
     except Exception as exc:  # noqa: BLE001
         print(f"⚠️  Narrative generation failed, falling back to a generic note: {exc}")
@@ -409,6 +438,16 @@ def build_summary_body(pr_title, score, minutes_saved, changed_file_names, findi
 # ---------------------------------------------------------------------------
 
 def post_review(owner, repo, pr_number, commit_id, body, comments):
+    """Posts the review to GitHub's Review API.
+
+    GitHub's Review API is atomic: if a single entry in `comments` maps
+    onto a line it considers invalid (stale diff, race with a new push,
+    an edge case our own line-validation missed), the API rejects the
+    ENTIRE review with a 422 — inline notes and summary body alike. That
+    would silently drop the Command Center summary even though it had
+    nothing wrong with it, so on a 422 we retry once with a summary-only
+    payload (no `comments`) to make sure the summary is never lost.
+    """
     url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/reviews"
     payload = {"commit_id": commit_id, "body": body, "event": "COMMENT"}
     if comments:
@@ -417,9 +456,25 @@ def post_review(owner, repo, pr_number, commit_id, body, comments):
     resp = requests.post(url, json=payload, headers=GITHUB_HEADERS)
     if resp.status_code in (200, 201):
         print("✅ Command Center review posted successfully.")
-    else:
-        print(f"❌ Failed to post review. Code: {resp.status_code}")
-        print(resp.text)
+        return
+
+    if resp.status_code == 422 and comments:
+        print(
+            "⚠️  Review with inline comments was rejected (422), likely due to "
+            "a stale or invalid line mapping. Retrying with summary only so "
+            "the Command Center summary isn't lost..."
+        )
+        fallback_payload = {"commit_id": commit_id, "body": body, "event": "COMMENT"}
+        fallback_resp = requests.post(url, json=fallback_payload, headers=GITHUB_HEADERS)
+        if fallback_resp.status_code in (200, 201):
+            print("✅ Command Center summary posted successfully (inline comments dropped).")
+        else:
+            print(f"❌ Fallback summary-only post also failed. Code: {fallback_resp.status_code}")
+            print(fallback_resp.text)
+        return
+
+    print(f"❌ Failed to post review. Code: {resp.status_code}")
+    print(resp.text)
 
 
 # ---------------------------------------------------------------------------
